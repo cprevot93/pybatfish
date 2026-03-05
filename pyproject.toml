@@ -43,14 +43,12 @@ keywords = ["network", "configuration", "verification"]
 dependencies = [
     "attrs>=18.1.0",
     "deepdiff",
+    "httpx[socks]>=0.28.1",
     "pandas",
     "python-dateutil",
     "PyYAML",
-    "requests",
-    "requests-toolbelt",
     "setuptools",
     "simplejson",
-    "urllib3>=1.26.0",
 ]
 
 [project.urls]
@@ -78,8 +76,6 @@ dev = [
     "pytest-cov",
     "pytz",
     "recommonmark",
-    "requests_mock",
-    "responses",
     "sphinx>=1.8.0",
     "sphinx-notfound-page",
     "sphinx_rtd_theme",
@@ -87,7 +83,6 @@ dev = [
     "types-python-dateutil",
     "types-pytz",
     "types-PyYAML",
-    "types-requests",
     "types-setuptools",
     "types-simplejson",
     "capirca",

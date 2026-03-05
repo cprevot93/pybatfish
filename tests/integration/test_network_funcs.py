@@ -16,7 +16,7 @@ from collections.abc import Sequence
 from os.path import abspath, dirname, join, realpath
 
 from pytest import fixture, raises
-from requests.exceptions import HTTPError
+from httpx import HTTPStatusError as HTTPError
 
 from pybatfish.client.consts import CoordConsts
 from pybatfish.client.options import Options

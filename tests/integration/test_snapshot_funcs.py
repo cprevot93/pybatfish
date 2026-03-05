@@ -16,7 +16,7 @@ import uuid
 from os.path import abspath, dirname, join, pardir, realpath
 
 import pytest
-from requests import HTTPError
+from httpx import HTTPStatusError as HTTPError
 
 from pybatfish.client.consts import BfConsts
 from pybatfish.client.session import Session

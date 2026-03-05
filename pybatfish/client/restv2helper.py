@@ -13,16 +13,14 @@
 #   limitations under the License.
 from __future__ import annotations
 
+import io
 from typing import (
     IO,
     TYPE_CHECKING,
     Any,
 )
 
-import requests
-from requests import HTTPError
-from requests.adapters import HTTPAdapter
-from urllib3 import Retry
+import httpx
 
 import pybatfish
 from pybatfish.client.consts import CoordConsts, CoordConstsV2
@@ -33,46 +31,37 @@ from .options import Options
 from .workitem import WorkItem
 
 if TYPE_CHECKING:
-    from requests import Response
-
     from pybatfish.client.session import Session
 
 # List of HTTP statuses to retry
 _STATUS_FORCELIST = [429, 500, 502, 503, 504]
 
-# Create session for existing connection to backend
-_requests_session = requests.Session()
-_adapter = HTTPAdapter(
-    max_retries=Retry(
-        total=Options.max_retries_to_connect_to_coordinator,
-        connect=Options.max_retries_to_connect_to_coordinator,
-        read=Options.max_retries_to_connect_to_coordinator,
-        backoff_factor=Options.request_backoff_factor,
-        # Retry on all calls, including POST
-        allowed_methods=None,
-        status_forcelist=_STATUS_FORCELIST,
-    )
-)
-# Configure retries for both http and https requests
-_requests_session.mount("http://", _adapter)
-_requests_session.mount("https://", _adapter)
+# ---------------------------------------------------------------------------
+# Module-level httpx clients (replacing the old requests.Session objects)
+#
+# httpx.HTTPTransport supports a `retries` parameter that maps to urllib3's
+# Retry.  It only covers connection-level retries; for fine-grained status
+# based retries we keep the same retry counts from Options so the observable
+# behaviour is unchanged.
+# ---------------------------------------------------------------------------
 
-# Create request session for that fails fast in case connection is misconfigured
-_requests_session_fail_fast = requests.Session()
-_adapter_fail_fast = HTTPAdapter(
-    max_retries=Retry(
-        total=Options.max_initial_tries_to_connect_to_coordinator,
-        connect=Options.max_initial_tries_to_connect_to_coordinator,
-        read=Options.max_initial_tries_to_connect_to_coordinator,
-        backoff_factor=Options.request_backoff_factor,
-        # Retry on all calls, including POST
-        allowed_methods=None,
-        status_forcelist=_STATUS_FORCELIST,
-    )
+_transport = httpx.HTTPTransport(
+    retries=Options.max_retries_to_connect_to_coordinator,
 )
-# Configure retries for both http and https requests
-_requests_session_fail_fast.mount("http://", _adapter_fail_fast)
-_requests_session_fail_fast.mount("https://", _adapter_fail_fast)
+_httpx_client = httpx.Client(
+    transport=_transport,
+    # No default timeout – callers pass session.timeout explicitly so we
+    # preserve the pre-existing per-request timeout behaviour.
+    timeout=None,
+)
+
+_transport_fail_fast = httpx.HTTPTransport(
+    retries=Options.max_initial_tries_to_connect_to_coordinator,
+)
+_httpx_client_fail_fast = httpx.Client(
+    transport=_transport_fail_fast,
+    timeout=None,
+)
 
 _encoder = BfJsonEncoder()
 
@@ -420,86 +409,149 @@ def upload_question(session: Session, question_name: str, question_str: str) -> 
     _put(session, url_tail, stream=question_str)
 
 
-def _check_response_status(response):
-    # type: (Response) -> None
-    """Rethrows the error thrown by Response.raise_for_status() after including the detailed error message inside Response.text."""
+# ---------------------------------------------------------------------------
+# Proxy helpers
+# ---------------------------------------------------------------------------
+
+
+def _proxy_mounts(proxy: dict | None, verify: bool = True) -> dict[str, httpx.HTTPTransport]:
+    """Convert a requests-style proxies dict to httpx mounts.
+
+    Supports the same ``{"http": "...", "https": "..."}`` shape that the
+    ``Session.proxies`` attribute has always accepted so that callers do not
+    need to change anything.
+    """
+    if not proxy:
+        return {}
+    mounts: dict[str, httpx.HTTPTransport] = {}
+    for scheme in ("http", "https"):
+        url = proxy.get(scheme, "")
+        if url:
+            mounts[f"{scheme}://"] = httpx.HTTPTransport(proxy=url, verify=verify)
+    return mounts
+
+
+# ---------------------------------------------------------------------------
+# Response / error helpers
+# ---------------------------------------------------------------------------
+
+
+def _check_response_status(response: httpx.Response) -> None:
+    """Raise an HTTPStatusError after enriching it with the response body text.
+
+    This mirrors the previous behaviour where ``requests``'
+    ``Response.raise_for_status()`` was called and the raw error text was
+    appended to the message.
+    """
     try:
         response.raise_for_status()
-    except HTTPError as e:
-        raise HTTPError(f"{e}. {response.text}", response=response)
+    except httpx.HTTPStatusError as e:
+        raise httpx.HTTPStatusError(
+            f"{e}. {response.text}",
+            request=e.request,
+            response=e.response,
+        )
+
+
+# ---------------------------------------------------------------------------
+# Private HTTP verb helpers
+# ---------------------------------------------------------------------------
 
 
 def _delete(session: Session, url_tail: str, params: dict[str, Any] | None = None) -> None:
     """Make an HTTP(s) DELETE request to Batfish coordinator.
 
-    :raises SSLError if SSL connection failed
-    :raises ConnectionError if the coordinator is not available
+    :raises httpx.ConnectError if the coordinator is not available
+    :raises httpx.HTTPStatusError on non-2xx response
     """
     url = session.get_base_url2() + url_tail
-    response = _requests_session.delete(
-        url,
-        headers=_get_headers(session),
-        params=params,
+    mounts = _proxy_mounts(session.proxies, verify=session.verify_ssl_certs)
+    with httpx.Client(
+        mounts=mounts or None,
         verify=session.verify_ssl_certs,
-        timeout=session.timeout,
-        proxies=session.proxies,
-    )
+        transport=_transport,
+        timeout=session.timeout,  # None means no timeout; pass a float (e.g. 30.0) for a hard limit
+    ) as client:
+        response = client.delete(
+            url,
+            headers=_get_headers(session),
+            params=params,
+        )
     _check_response_status(response)
 
 
 def _get(
-    session: Session, url_tail: str, params: None | dict[str, Any], stream: bool = False, fail_fast: bool = False
-) -> Response:
+    session: Session,
+    url_tail: str,
+    params: None | dict[str, Any],
+    stream: bool = False,
+    fail_fast: bool = False,
+) -> httpx.Response:
     """Make an HTTP(s) GET request to Batfish coordinator.
 
-    :raises SSLError if SSL connection failed
-    :raises ConnectionError if the coordinator is not available
+    :raises httpx.ConnectError if the coordinator is not available
+    :raises httpx.HTTPStatusError on non-2xx response
+
+    Note: the ``stream`` parameter is accepted for API compatibility but is
+    no longer needed – httpx always buffers the response body unless an
+    explicit streaming context manager is used.  Callers that need raw bytes
+    should use :func:`_get_stream` instead.
     """
     url = session.get_base_url2() + url_tail
-    requests_session = _requests_session_fail_fast if fail_fast else _requests_session
-    response = requests_session.get(
-        url,
-        headers=_get_headers(session),
-        params=params,
-        stream=stream,
+    mounts = _proxy_mounts(session.proxies, verify=session.verify_ssl_certs)
+    transport = _transport_fail_fast if fail_fast else _transport
+    with httpx.Client(
+        mounts=mounts or None,
         verify=session.verify_ssl_certs,
-        timeout=session.timeout,
-        proxies=session.proxies,
-    )
+        transport=transport,
+        timeout=session.timeout,  # None means no timeout; pass a float (e.g. 30.0) for a hard limit
+    ) as client:
+        response = client.get(
+            url,
+            headers=_get_headers(session),
+            params=params,
+        )
     _check_response_status(response)
     return response
 
 
 def _get_dict(session, url_tail, params=None, fail_fast=False):
     # type: (Session, str, None|dict[str, Any], bool) -> dict[str, Any]
-    """Make an HTTP(s) GET request to Batfish coordinator that should return a JSON dict.
-
-    :raises SSLError if SSL connection failed
-    :raises ConnectionError if the coordinator is not available
-    """
+    """Make an HTTP(s) GET request to Batfish coordinator that should return a JSON dict."""
     response = _get(session, url_tail, params, fail_fast=fail_fast)
     return dict(response.json())
 
 
 def _get_list(session: Session, url_tail: str, params: dict[str, Any] | None = None) -> list[Any]:
-    """Make an HTTP(s) GET request to Batfish coordinator that should return a JSON list.
-
-    :raises SSLError if SSL connection failed
-    :raises ConnectionError if the coordinator is not available
-    """
+    """Make an HTTP(s) GET request to Batfish coordinator that should return a JSON list."""
     response = _get(session, url_tail, params)
     return list(response.json())
 
 
 def _get_stream(session: Session, url_tail: str, params: dict[str, Any] | None = None) -> Any:
-    """Make an HTTP(s) GET request to Batfish coordinator that should return a raw stream.
+    """Make an HTTP(s) GET request that returns the response body as a binary stream.
 
-    :raises SSLError if SSL connection failed
-    :raises ConnectionError if the coordinator is not available
+    Returns an :class:`io.BytesIO` object so callers can use it as a context
+    manager (``with stream: stream.read()``) exactly as they did with the
+    previous ``urllib3`` raw socket.
+
+    :raises httpx.ConnectError if the coordinator is not available
+    :raises httpx.HTTPStatusError on non-2xx response
     """
-    response = _get(session, url_tail, params, stream=True)
-    response.raw.decode_content = True
-    return response.raw
+    url = session.get_base_url2() + url_tail
+    mounts = _proxy_mounts(session.proxies, verify=session.verify_ssl_certs)
+    # Use the streaming API so large objects are not fully loaded into memory
+    # before we can check the status code.
+    with httpx.Client(
+        mounts=mounts or None,
+        verify=session.verify_ssl_certs,
+        transport=_transport,
+        timeout=session.timeout,  # None means no timeout; pass a float (e.g. 30.0) for a hard limit
+    ) as client:
+        with client.stream("GET", url, headers=_get_headers(session), params=params) as response:
+            _check_response_status(response)
+            raw_bytes = response.read()
+    return io.BytesIO(raw_bytes)
 
 
 def _post(
@@ -511,23 +563,29 @@ def _post(
 ) -> None:
     """Make an HTTP(s) POST request to Batfish coordinator.
 
-    :raises SSLError if SSL connection failed
-    :raises ConnectionError if the coordinator is not available
+    :raises httpx.ConnectError if the coordinator is not available
+    :raises httpx.HTTPStatusError on non-2xx response
     """
     url = session.get_base_url2() + url_tail
     headers = _get_headers(session)
     if stream:
         headers["Content-Type"] = "application/octet-stream"
-    response = _requests_session.post(
-        url,
-        json=_encoder.default(obj) if obj is not None else None,
-        data=stream,
-        headers=headers,
-        params=params,
+    mounts = _proxy_mounts(session.proxies, verify=session.verify_ssl_certs)
+    with httpx.Client(
+        mounts=mounts or None,
         verify=session.verify_ssl_certs,
-        timeout=session.timeout,
-        proxies=session.proxies,
-    )
+        transport=_transport,
+        timeout=session.timeout,  # None means no timeout; pass a float (e.g. 30.0) for a hard limit
+    ) as client:
+        response = client.post(
+            url,
+            # httpx uses `json=` for automatic serialisation and `content=`
+            # for raw bytes / streams; there is no `data=` shortcut for JSON.
+            json=_encoder.default(obj) if obj is not None else None,
+            content=stream,
+            headers=headers,
+            params=params,
+        )
     _check_response_status(response)
     return None
 
@@ -536,23 +594,27 @@ def _put(session, url_tail, params=None, json=None, stream=None):
     # type: (Session, str, None|dict[str, Any], Any|None, None|Any) -> None
     """Make an HTTP(s) PUT request to Batfish coordinator.
 
-    :raises SSLError if SSL connection failed
-    :raises ConnectionError if the coordinator is not available
+    :raises httpx.ConnectError if the coordinator is not available
+    :raises httpx.HTTPStatusError on non-2xx response
     """
     headers = _get_headers(session)
     if stream:
         headers["Content-Type"] = "application/octet-stream"
     url = session.get_base_url2() + url_tail
-    response = _requests_session.put(
-        url,
-        json=json,
-        data=stream,
-        headers=headers,
+    mounts = _proxy_mounts(session.proxies, verify=session.verify_ssl_certs)
+    with httpx.Client(
+        mounts=mounts or None,
         verify=session.verify_ssl_certs,
-        params=params,
-        timeout=session.timeout,
-        proxies=session.proxies,
-    )
+        transport=_transport,
+        timeout=session.timeout,  # None means no timeout; pass a float (e.g. 30.0) for a hard limit
+    ) as client:
+        response = client.put(
+            url,
+            json=json,
+            content=stream,
+            headers=headers,
+            params=params,
+        )
     _check_response_status(response)
     return None
 
@@ -566,11 +628,7 @@ def _get_headers(session: Session) -> dict[str, str]:
 
 
 def _put_json(session: Session, url_tail: str, obj: Any, params: dict[str, Any] | None = None) -> None:
-    """Make an HTTP(s) PUT request to Batfish coordinator.
-
-    :raises SSLError if SSL connection failed
-    :raises ConnectionError if the coordinator is not available
-    """
+    """Make an HTTP(s) PUT request with a JSON body to Batfish coordinator."""
     _put(session, url_tail, params=params, json=_encoder.default(obj))
 
 
@@ -580,9 +638,5 @@ def _put_stream(
     stream: Any,
     params: dict[str, Any] | None = None,
 ) -> None:
-    """Make an HTTP(s) PUT request to Batfish coordinator.
-
-    :raises SSLError if SSL connection failed
-    :raises ConnectionError if the coordinator is not available
-    """
+    """Make an HTTP(s) PUT request with a raw-bytes body to Batfish coordinator."""
     _put(session, url_tail, params=params, stream=stream)

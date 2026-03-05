@@ -27,7 +27,7 @@ from typing import (
     Any,
 )
 
-from requests import HTTPError
+from httpx import HTTPStatusError as HTTPError
 
 from pybatfish.client import restv2helper, workhelper
 from pybatfish.client._facts import get_facts, load_facts, validate_facts, write_facts
