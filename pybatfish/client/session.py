@@ -319,9 +319,13 @@ class Session:
     :ivar port_v2: Legacy alias for port
     :ivar ssl: Whether to use SSL when connecting to Batfish (False by default)
     :ivar api_key: Your API key
-    :ivar proxies: A dictionary of proxy URLs using the existing ``http`` and
-        ``https`` keys; these are translated into HTTPX2 mounts.
-    :ivar timeout: Timeout for HTTPX2 requests in seconds (default is 30 seconds)
+    :ivar proxies: A dictionary of proxy URLs using ``http``/``https`` keys;
+        these are translated into HTTPX2 mounts.
+    :ivar timeout: Timeout for HTTPX2 requests in seconds (default is 30
+        seconds). Pass ``None`` to disable the timeout.
+    :ivar request_kwargs: Additional HTTPX2-compatible options. ``proxies`` and
+        ``verify`` are translated into client configuration; request-specific
+        options are forwarded when supported.
     """
 
     def __init__(
@@ -337,7 +341,8 @@ class Session:
         api_key: str = CoordConsts.DEFAULT_API_KEY,
         load_questions: bool = True,
         proxies: dict[str, str] | None = None,
-        timeout: int = 30,
+        timeout: float | None = 30,
+        request_kwargs: dict[str, Any] | None = None,
     ):
         # Coordinator args
         self.host: str = host
@@ -365,8 +370,9 @@ class Session:
 
         self.elapsed_delay: int = 5
         self.stale_timeout: int = 5
-        self.proxies = proxies
-        self.timeout = timeout
+        self.proxies: dict[str, str] | None = proxies
+        self.timeout: float | None = timeout
+        self.request_kwargs: dict[str, Any] = dict(request_kwargs or {})
         # HTTPX2 clients are created lazily by restv2helper.  Keeping these
         # attributes on the Session gives each Session its own connection pool
         # while preserving the historical ability to construct a Session
@@ -377,6 +383,22 @@ class Session:
         # Auto-load question templates
         if load_questions:
             self.q.load()
+
+    def _get_request_kwargs(self) -> dict[str, Any]:
+        """Return merged HTTPX2-compatible request options.
+
+        Generic options supplied through :attr:`request_kwargs` are merged
+        first. Explicit ``proxies`` and ``timeout`` session arguments then
+        override matching generic values, preserving the historical helper's
+        public behavior. The REST transport additionally handles ``verify``
+        and filters options according to HTTPX2's client/request APIs.
+        """
+        merged: dict[str, Any] = dict(self.request_kwargs)
+        if self.proxies is not None:
+            merged["proxies"] = self.proxies
+        if self.timeout is not None:
+            merged["timeout"] = self.timeout
+        return merged
 
     def close(self) -> None:
         """Release HTTPX2 connection pools owned by this session."""
@@ -626,6 +648,31 @@ class Session:
         work_item = workhelper.get_workitem_generate_dataplane(self, snapshot)
         answer_dict = workhelper.execute(work_item, self, extra_args=extra_args)
         return str(answer_dict["status"].value)
+
+    def answer_question(
+        self,
+        question_str: str,
+        question_name: str,
+        background: bool,
+        snapshot: str,
+        reference_snapshot: str | None,
+        extra_args: dict[str, Any] | None,
+    ) -> Answer | str:
+        """Upload, execute, and return the answer for a question.
+
+        Subclasses can override this method to change how questions are
+        answered, for example when using a different backend.
+        """
+        if not question_name:
+            question_name = Options.default_question_prefix + "_" + get_uuid()
+
+        restv2helper.upload_question(self, question_name, question_str)
+        work_item = workhelper.get_workitem_answer(self, question_name, snapshot, reference_snapshot)
+        workhelper.execute(work_item, self, background, extra_args)
+
+        if background:
+            return work_item.id
+        return self.get_answer(question_name, snapshot, reference_snapshot)
 
     def get_answer(self, question: str, snapshot: str, reference_snapshot: str | None = None) -> Answer:
         """

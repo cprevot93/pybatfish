@@ -1,3 +1,5 @@
+import pytest
+
 from pybatfish.client.session import Session
 
 session = Session(load_questions=False)

@@ -20,8 +20,8 @@ jobs:
   format:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
-      - uses: actions/setup-python@v6
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.10"
       - name: Run checks
@@ -31,8 +31,8 @@ jobs:
   mypy:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
-      - uses: actions/setup-python@v6
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.10"
       - name: Run checks
@@ -44,21 +44,21 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout Batfish repo
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
         with:
           repository: ${{ inputs.batfish_repo }}
           ref: ${{ inputs.batfish_ref }}
       - name: Bazel cache
-        uses: actions/cache@v5
+        uses: actions/cache@v6
         with:
           path: "~/.cache/bazel"
-          key: ${{runner.os}}-bazel-17-${{ hashFiles('.bazelversion', 'WORKSPACE', 'maven_install.json') }}-${{ needs.get_date.outputs.ymd }}
+          key: ${{runner.os}}-bazel-25-${{ hashFiles('.bazelversion', 'WORKSPACE', 'maven_install.json') }}-${{ needs.get_date.outputs.ymd }}
           restore-keys: |
-            ${{runner.os}}-bazel-17-${{ hashFiles('.bazelversion', 'WORKSPACE', 'maven_install.json') }}-
+            ${{runner.os}}-bazel-25-${{ hashFiles('.bazelversion', 'WORKSPACE', 'maven_install.json') }}-
       - uses: actions/setup-java@v5
         with:
           distribution: "temurin"
-          java-version: "17"
+          java-version: "25"
       - name: Build JAR
         run: |
           bazel build //projects/allinone:allinone_main_deploy.jar
@@ -83,8 +83,8 @@ jobs:
   unit_tests:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
-      - uses: actions/setup-python@v6
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
         with:
           python-version: ${{ matrix.python_version }}
       - name: Run tests
@@ -111,12 +111,12 @@ jobs:
     needs:
       - bf_build
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - uses: actions/setup-java@v5
         with:
           distribution: "temurin"
-          java-version: "17"
-      - uses: actions/setup-python@v6
+          java-version: "25"
+      - uses: actions/setup-python@v7
         with:
           python-version: ${{ matrix.python_version }}
       - name: Download bf JAR
@@ -160,14 +160,14 @@ jobs:
     needs:
       - bf_build
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - uses: actions/setup-java@v5
         with:
           distribution: "temurin"
-          java-version: "17"
-      - uses: actions/setup-python@v6
+          java-version: "25"
+      - uses: actions/setup-python@v7
         with:
-          python-version: "3.10"
+          python-version: "3.14"
       - name: Download bf JAR
         uses: actions/download-artifact@v8
         with:
@@ -187,12 +187,12 @@ jobs:
   build_docs:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - uses: actions/setup-java@v5
         with:
           distribution: "temurin"
-          java-version: "17"
-      - uses: actions/setup-python@v6
+          java-version: "25"
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.10"
       - name: Build docs
@@ -212,8 +212,8 @@ jobs:
   readthedocs_build:
     runs-on: ubuntu-22.04 # Match ReadTheDocs OS
     steps:
-      - uses: actions/checkout@v6
-      - uses: actions/setup-python@v6
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.10" # Match ReadTheDocs Python version
       - name: Build docs in ReadTheDocs-like environment

@@ -422,10 +422,12 @@ def _check_response_status(response: httpx2.Response) -> None:
         raise httpx2.HTTPStatusError(f"{exc}. {detail}", request=exc.request, response=exc.response) from exc
 
 
-def _proxy_mounts(proxies: dict[str, str] | None, verify: bool = True) -> dict[str, Any]:
-    """Translate Requests-style proxy keys into HTTPX2 transport mounts."""
+def _proxy_mounts(proxies: dict[str, str] | str | None, verify: bool = True) -> dict[str, Any]:
+    """Translate proxy mappings into HTTPX2 transport mounts."""
     if not proxies:
         return {}
+    if isinstance(proxies, str):
+        proxies = {"all": proxies}
     mounts: dict[str, Any] = {}
     for key, proxy in proxies.items():
         if not proxy:
@@ -436,28 +438,104 @@ def _proxy_mounts(proxies: dict[str, str] | None, verify: bool = True) -> dict[s
         elif scheme in {"http", "https"}:
             mount_key = f"{scheme}://"
         else:
-            # Ignore auxiliary entries such as ``no_proxy``.  Requests-style
-            # proxy mappings route HTTP(S) targets only; SOCKS is expressed by
-            # the proxy URL value.
+            # Ignore auxiliary entries such as ``no_proxy``. HTTP(S) targets
+            # are selected by the mapping key; SOCKS is expressed in the URL.
             continue
         mounts[mount_key] = httpx2.HTTPTransport(proxy=proxy, retries=0, verify=verify)
     return mounts
 
 
-def _proxy_key(proxies: dict[str, str] | None) -> tuple[tuple[str, str], ...]:
+def _proxy_key(proxies: dict[str, str] | str | None) -> tuple[tuple[str, str], ...]:
+    if isinstance(proxies, str):
+        return (("all", proxies),)
     return tuple(sorted((str(k), str(v)) for k, v in (proxies or {}).items()))
 
 
+# Options accepted by HTTPX2.Client and Client.request/Client.stream.  The
+# Session API historically accepted arbitrary transport keyword arguments, so
+# unknown options are intentionally ignored instead of being passed through to
+# HTTPX2 and raising a surprising TypeError.
+_CLIENT_OPTION_NAMES = {
+    "auth",
+    "params",
+    "headers",
+    "cookies",
+    "cert",
+    "trust_env",
+    "http1",
+    "http2",
+    "proxy",
+    "mounts",
+    "follow_redirects",
+    "limits",
+    "max_redirects",
+    "event_hooks",
+    "base_url",
+    "transport",
+    "default_encoding",
+}
+_REQUEST_OPTION_NAMES = {
+    "content",
+    "data",
+    "files",
+    "json",
+    "params",
+    "headers",
+    "cookies",
+    "auth",
+    "follow_redirects",
+    "extensions",
+}
+
+
+def _session_request_kwargs(session: Session) -> dict[str, Any]:
+    """Return a defensive copy of optional transport kwargs on ``session``."""
+    getter = getattr(session, "_get_request_kwargs", None)
+    if callable(getter):
+        kwargs = getter()
+    else:
+        kwargs = getattr(session, "request_kwargs", {})
+    return dict(kwargs) if isinstance(kwargs, dict) else {}
+
+
+def _effective_verify(session: Session, request_kwargs: dict[str, Any]) -> Any:
+    """Resolve the HTTPX2 TLS verification setting.
+
+    ``verify_ssl_certs`` is the explicit Session setting.  For backwards
+    compatibility with the master branch's ``request_kwargs`` API, a generic
+    ``verify`` option is honored when the Session is otherwise using its
+    default verification setting.
+    """
+    session_verify = getattr(session, "verify_ssl_certs", True)
+    generic_verify = request_kwargs.get("verify")
+    if generic_verify is not None and session_verify == Options.verify_ssl_certs:
+        return generic_verify
+    return session_verify
+
+
 def _new_client(session: Session, fail_fast: bool) -> httpx2.Client:
-    verify = session.verify_ssl_certs
-    return httpx2.Client(
-        mounts=_proxy_mounts(session.proxies, verify=verify) or None,
-        verify=verify,
-        # Timeouts are deliberately supplied on each request so changing a
-        # Session's timeout does not require rebuilding its connection pool.
-        timeout=None,
-        trust_env=True,
-    )
+    request_kwargs = _session_request_kwargs(session)
+    verify = _effective_verify(session, request_kwargs)
+    session_proxies = getattr(session, "proxies", None)
+    proxies = session_proxies if session_proxies is not None else request_kwargs.get("proxies")
+
+    client_kwargs = {key: value for key, value in request_kwargs.items() if key in _CLIENT_OPTION_NAMES}
+    # Session-level proxy and TLS settings are represented using HTTPX2's
+    # native client configuration. They take precedence over generic options.
+    proxy_mounts = _proxy_mounts(proxies, verify=verify) if proxies else {}
+    if proxy_mounts:
+        client_kwargs["mounts"] = proxy_mounts
+        client_kwargs.pop("proxy", None)
+        client_kwargs.pop("transport", None)
+    elif session_proxies is not None:
+        client_kwargs.pop("mounts", None)
+        client_kwargs.pop("proxy", None)
+    client_kwargs["verify"] = verify
+    # Timeout is deliberately supplied on each request so changing a
+    # Session's timeout does not require rebuilding its connection pool.
+    client_kwargs["timeout"] = None
+    client_kwargs.setdefault("trust_env", True)
+    return httpx2.Client(**client_kwargs)
 
 
 def _get_client(session: Session, fail_fast: bool = False) -> httpx2.Client:
@@ -535,6 +613,37 @@ def _clean_params(params: dict[str, Any] | None) -> dict[str, Any] | None:
     return {key: value for key, value in params.items() if value is not None}
 
 
+def _request_options(
+    session: Session,
+    params: dict[str, Any] | None,
+    headers: dict[str, str],
+    json: Any,
+    content: Any,
+) -> dict[str, Any]:
+    """Build HTTPX2 request options while protecting transport invariants."""
+    generic = _session_request_kwargs(session)
+    options = {key: value for key, value in generic.items() if key in _REQUEST_OPTION_NAMES}
+
+    # Preserve additional caller headers while ensuring Batfish's required
+    # headers win if a generic option supplied the same key.
+    generic_headers = options.get("headers")
+    if isinstance(generic_headers, dict):
+        merged_headers = dict(generic_headers)
+        merged_headers.update(headers)
+        options["headers"] = merged_headers
+    else:
+        options["headers"] = headers
+
+    # The REST helper owns query/body/timeout values. These internal fields
+    # always override generic request options, including an explicit None
+    # timeout which disables request timeouts.
+    options["params"] = _clean_params(params)
+    options["json"] = json
+    options["content"] = content
+    options["timeout"] = session.timeout
+    return options
+
+
 def _request(
     session: Session,
     method: str,
@@ -564,15 +673,7 @@ def _request(
         if attempt and not _rewind_body(content, position):
             raise ValueError("Request body cannot be rewound for retry")
         try:
-            response = client.request(
-                method,
-                url,
-                headers=request_headers,
-                params=_clean_params(params),
-                json=json,
-                content=content,
-                timeout=session.timeout,
-            )
+            response = client.request(method, url, **_request_options(session, params, request_headers, json, content))
         except httpx2.TransportError:
             if attempt + 1 >= max_attempts or not replayable:
                 raise
@@ -604,7 +705,12 @@ def _get(
     return _request(session, "GET", url_tail, params=params, fail_fast=fail_fast)
 
 
-def _get_dict(session, url_tail, params=None, fail_fast=False):
+def _get_dict(
+    session: Session,
+    url_tail: str,
+    params: dict[str, Any] | None = None,
+    fail_fast: bool = False,
+) -> dict[str, Any]:
     response = _get(session, url_tail, params, fail_fast=fail_fast)
     try:
         return dict(response.json())
@@ -612,7 +718,7 @@ def _get_dict(session, url_tail, params=None, fail_fast=False):
         response.close()
 
 
-def _get_list(session, url_tail, params=None):
+def _get_list(session: Session, url_tail: str, params: dict[str, Any] | None = None) -> list[Any]:
     response = _get(session, url_tail, params)
     try:
         return list(response.json())
@@ -677,9 +783,8 @@ def _get_stream(session: Session, url_tail: str, params: dict[str, Any] | None =
     url = session.get_base_url2() + url_tail
     max_attempts = max(1, int(Options.max_retries_to_connect_to_coordinator) + 1)
     for attempt in range(max_attempts):
-        context = client.stream(
-            "GET", url, headers=_get_headers(session), params=_clean_params(params), timeout=session.timeout
-        )
+        stream_options = _request_options(session, params, _get_headers(session), None, None)
+        context = client.stream("GET", url, **stream_options)
         try:
             response = context.__enter__()
         except httpx2.TransportError:

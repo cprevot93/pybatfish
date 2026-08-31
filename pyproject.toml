@@ -61,6 +61,9 @@ capirca = [
     "capirca",
     "absl-py>=0.8.0",
 ]
+mcp = [
+    "mcp>=1.23.0,<2.0.0",
+]
 dev = [
     "ruff",
     "cerberus",
@@ -79,7 +82,6 @@ dev = [
     "sphinx>=1.8.0",
     "sphinx-notfound-page",
     "sphinx_rtd_theme",
-    "types-decorator",
     "types-python-dateutil",
     "types-pytz",
     "types-PyYAML",
@@ -87,10 +89,14 @@ dev = [
     "types-simplejson",
     "capirca",
     "absl-py>=0.8.0",
+    "mcp>=1.23.0,<2.0.0",
 ]
 
 [project.entry-points."batfish_session"]
 bf = "pybatfish.client.session:Session"
+
+[project.scripts]
+batfish-mcp = "pybatfish.mcp.__main__:main"
 
 [tool.setuptools]
 packages = {find = {exclude = ["contrib", "docs", "tests"]}}
