@@ -2,250 +2,118 @@
 #
 #   Licensed under the Apache License, Version 2.0 (the "License");
 #   you may not use this file except in compliance with the License.
-#   You may obtain a copy of the License at
-#
-#       http://www.apache.org/licenses/LICENSE-2.0
-#
-#   Unless required by applicable law or agreed to in writing, software
-#   distributed under the License is distributed on an "AS IS" BASIS,
-#   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-#   See the License for the specific language governing permissions and
-#   limitations under the License.
+"""Tests for the HTTPX2 REST transport."""
+
 import io
-import json
 from unittest.mock import Mock, patch
 
+import httpx2
 import pytest
-import requests
-from requests import HTTPError, Response
 
 from pybatfish.client import restv2helper
 from pybatfish.client.consts import CoordConsts
-from pybatfish.client.options import Options
-from pybatfish.client.restv2helper import (
-    _adapter,
-    _adapter_fail_fast,
-    _delete,
-    _encoder,
-    _get,
-    _get_headers,
-    _post,
-    _put,
-    _requests_session,
-    _requests_session_fail_fast,
-    get_api_version,
-)
 from pybatfish.client.session import Session
 
-BASE_URL = "base"
+BASE_URL = "http://example.test"
 
 
-class MockResponse(Response):
-    def __init__(self, text):
-        super().__init__()
-        self._text = text
-
-    @property
-    def text(self):
-        return self._text
+@pytest.fixture
+def session():
+    session = Session(host="example.test", load_questions=False)
+    session.get_base_url2 = Mock(return_value=BASE_URL)
+    yield session
+    session.close()
 
 
-@pytest.fixture(scope="module")
-def session() -> Session:
-    s = Mock(spec=Session)
-    s.get_base_url2.return_value = BASE_URL
-    s.api_key = "0000"
-    s.verify_ssl_certs = True
-    s.timeout = 30
-    s.proxies = None
-    return s
-
-
-@pytest.fixture(scope="module")
-def request_session() -> requests.Session:
-    return Mock(spec=requests.Session)
+def install_transport(session, handler):
+    client = httpx2.Client(transport=httpx2.MockTransport(handler))
+    session._httpx_client = client
+    session._httpx_client_config = (True, tuple())
+    return client
 
 
 def test_check_response_status_error():
-    response = MockResponse("error detail")
-    response.status_code = 400
-    with pytest.raises(HTTPError) as e:
+    response = httpx2.Response(400, text="error detail", request=httpx2.Request("GET", BASE_URL))
+    with pytest.raises(httpx2.HTTPStatusError, match="error detail"):
         restv2helper._check_response_status(response)
-    assert "error detail" in str(e.value)
+    assert response.is_closed
 
 
-def test_check_response_status_ok():
-    response = MockResponse("no error")
-    response.status_code = 200
-    restv2helper._check_response_status(response)
+def test_proxy_mounts():
+    mounts = restv2helper._proxy_mounts({"http": "http://proxy:3128", "https": "socks5://proxy:1080"})
+    assert set(mounts) == {"http://", "https://"}
+    assert all(isinstance(transport, httpx2.HTTPTransport) for transport in mounts.values())
 
 
-def test_delete(session: Session, request_session: Mock) -> None:
-    """Make sure calls to _delete end up using the correct session."""
-    resource_url = "/test/url"
-    target_url = f"{BASE_URL}{resource_url}"
+def test_verbs_and_forwarding(session):
+    seen = []
 
-    with patch("pybatfish.client.restv2helper._requests_session", request_session):
-        # Execute the request
-        _delete(session, resource_url)
-    # Should pass through to the correct session
-    request_session.delete.assert_called_with(
-        target_url,
-        headers=_get_headers(session),
-        params=None,
-        verify=session.verify_ssl_certs,
-        proxies=session.proxies,
-        timeout=session.timeout,
-    )
+    def handler(request):
+        seen.append((request.method, request.url.path, request.headers["x-batfish-apikey"]))
+        return httpx2.Response(200, json={}, request=request)
 
-
-def test_get(session: Session, request_session: Mock) -> None:
-    """Make sure calls to _get end up using the correct session."""
-    resource_url = "/test/url"
-    target_url = f"{BASE_URL}{resource_url}"
-
-    # Regular session
-    with patch("pybatfish.client.restv2helper._requests_session", request_session):
-        # Execute the request
-        _get(session, resource_url, None)
-    # Should pass through to the correct session
-    request_session.get.assert_called_with(
-        target_url,
-        headers=_get_headers(session),
-        params=None,
-        stream=False,
-        verify=session.verify_ssl_certs,
-        proxies=session.proxies,
-        timeout=session.timeout,
-    )
-
-    # Fast-failing session
-    with patch("pybatfish.client.restv2helper._requests_session_fail_fast", request_session):
-        # Execute the request, specifying fast-failing behavior
-        _get(session, resource_url, None, fail_fast=True)
-    # Should pass through to the correct session
-    request_session.get.assert_called_with(
-        target_url,
-        headers=_get_headers(session),
-        params=None,
-        stream=False,
-        verify=session.verify_ssl_certs,
-        proxies=session.proxies,
-        timeout=session.timeout,
-    )
+    install_transport(session, handler)
+    restv2helper._get(session, "/get", {"a": "b"})
+    restv2helper._post(session, "/post", {"value": 1})
+    restv2helper._put(session, "/put", json={"value": 2})
+    restv2helper._delete(session, "/delete")
+    assert [(method, path) for method, path, _ in seen] == [
+        ("GET", "/get"),
+        ("POST", "/post"),
+        ("PUT", "/put"),
+        ("DELETE", "/delete"),
+    ]
+    assert all(api_key == session.api_key for _, _, api_key in seen)
 
 
-def test_post_json(session, request_session):
-    """Make sure calls to _post of json end up using the correct session."""
-    resource_url = "/test/url"
-    target_url = f"{BASE_URL}{resource_url}"
-    obj = "foo"
+def test_retry_status_and_rewind(session):
+    calls = []
+    body = io.BytesIO(b"payload")
 
-    with patch("pybatfish.client.restv2helper._requests_session", request_session):
-        # Execute the request
-        _post(session, resource_url, obj)
-    # Should pass through to the correct session
-    request_session.post.assert_called_with(
-        target_url,
-        data=None,
-        json=_encoder.default(obj),
-        headers=_get_headers(session),
-        params=None,
-        verify=session.verify_ssl_certs,
-        proxies=session.proxies,
-        timeout=session.timeout,
-    )
+    def handler(request):
+        calls.append(request.content)
+        return httpx2.Response(503 if len(calls) == 1 else 200, text="retry", request=request)
+
+    install_transport(session, handler)
+    with patch.object(restv2helper.time, "sleep"):
+        restv2helper._post(session, "/upload", None, stream=body)
+    assert calls == [b"payload", b"payload"]
+    assert body.tell() == len(body.getvalue())
 
 
-def test_post_stream(session, request_session):
-    """Make sure calls to _post of stream end up using the correct session."""
-    resource_url = "/test/url"
-    target_url = f"{BASE_URL}{resource_url}"
-    with io.StringIO() as stream_data:
-        with patch("pybatfish.client.restv2helper._requests_session", request_session):
-            # Execute the request
-            _post(session, resource_url, None, stream=stream_data)
-        # Should pass through to the correct session
-        expected_headers = _get_headers(session)
-        expected_headers["Content-Type"] = "application/octet-stream"
-        request_session.post.assert_called_with(
-            target_url,
-            data=stream_data,
-            json=None,
-            headers=expected_headers,
-            params=None,
-            verify=session.verify_ssl_certs,
-            proxies=session.proxies,
-            timeout=session.timeout,
-        )
+def test_get_stream_is_incremental(session):
+    reads = []
+
+    def handler(request):
+        def chunks():
+            reads.append("started")
+            yield b"first"
+            yield b"second"
+
+        return httpx2.Response(200, content=chunks(), request=request)
+
+    install_transport(session, handler)
+    stream = restv2helper._get_stream(session, "/stream")
+    assert reads == []
+    assert stream.read(5) == b"first"
+    assert reads == ["started"]
+    assert stream.read() == b"second"
+    stream.close()
+    assert stream.closed
 
 
-def test_put(session, request_session):
-    """Make sure calls to _put end up using the correct session."""
-    resource_url = "/test/url"
-    target_url = f"{BASE_URL}{resource_url}"
+def test_get_api_version(session):
+    def handler(request):
+        return httpx2.Response(200, json={CoordConsts.KEY_API_VERSION: "2.1.0"}, request=request)
 
-    with patch("pybatfish.client.restv2helper._requests_session", request_session):
-        # Execute the request
-        _put(session, resource_url)
-    # Should pass through to the correct session
-    request_session.put.assert_called_with(
-        target_url,
-        json=None,
-        data=None,
-        headers=_get_headers(session),
-        verify=session.verify_ssl_certs,
-        params=None,
-        proxies=session.proxies,
-        timeout=session.timeout,
-    )
+    install_transport(session, handler)
+    assert restv2helper.get_api_version(session) == "2.1.0"
 
 
-def test_session_adapters():
-    """Confirm session is configured with correct http and https adapters."""
-    http = _requests_session.adapters["http://"]
-    https = _requests_session.adapters["https://"]
-
-    assert http == _adapter
-    assert https == _adapter
-    # Also make sure retries are configured
-    retries = _adapter.max_retries
-    assert retries.total == Options.max_retries_to_connect_to_coordinator
-    assert retries.connect == Options.max_retries_to_connect_to_coordinator
-    assert retries.read == Options.max_retries_to_connect_to_coordinator
-    # All request types should be retried
-    assert not retries.allowed_methods
-
-
-def test_fail_fast_session_adapters():
-    """Confirm fast-failing session is configured with correct http and https adapters."""
-    http = _requests_session_fail_fast.adapters["http://"]
-    https = _requests_session_fail_fast.adapters["https://"]
-    assert http == _adapter_fail_fast
-    assert https == _adapter_fail_fast
-    # Also make sure retries are configured correctly
-    retries = _adapter_fail_fast.max_retries
-    assert retries.total == Options.max_initial_tries_to_connect_to_coordinator
-    assert retries.connect == Options.max_initial_tries_to_connect_to_coordinator
-    assert retries.read == Options.max_initial_tries_to_connect_to_coordinator
-    # All request types should be retried
-    assert not retries.allowed_methods
-
-
-def test_get_api_version_old(session: Session, request_session: Mock) -> None:
-    mock_response = MockResponse(json.dumps({}))
-    mock_response.status_code = 200
-    with patch("pybatfish.client.restv2helper._requests_session", request_session):
-        request_session.get.return_value = mock_response
-        assert get_api_version(session) == "2.0.0"
-
-
-def test_get_api_version_new(session: Session, request_session: Mock) -> None:
-    mock_response = MockResponse(json.dumps({CoordConsts.KEY_API_VERSION: "2.1.0"}))
-    mock_response.status_code = 200
-    with patch("pybatfish.client.restv2helper._requests_session", request_session):
-        request_session.get.return_value = mock_response
-        assert get_api_version(session) == "2.1.0"
+def test_session_context_manager():
+    with Session(load_questions=False) as session:
+        assert session._httpx_client is None
+    assert session._httpx_client is None
 
 
 if __name__ == "__main__":

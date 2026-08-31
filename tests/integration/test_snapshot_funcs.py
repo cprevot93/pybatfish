@@ -16,7 +16,7 @@ import uuid
 from os.path import abspath, dirname, join, pardir, realpath
 
 import pytest
-from requests import HTTPError
+from httpx2 import HTTPStatusError
 
 from pybatfish.client.consts import BfConsts
 from pybatfish.client.session import Session
@@ -120,7 +120,7 @@ def test_fork_snapshot_bad_restore(bf: Session, network: str, example_snapshot: 
     bf.set_network(network)
     # Should fail when trying to restore an item that was never deactivated
     # in base snapshot
-    with pytest.raises(HTTPError):
+    with pytest.raises(HTTPStatusError):
         bf.fork_snapshot(base_name=example_snapshot, name=fail_name, restore_nodes=[node])
 
 
@@ -159,7 +159,7 @@ def test_fork_snapshot_no_base(bf: Session, network: str) -> None:
 
     bf.set_network(network)
     # Should fail with non-existent base snapshot
-    with pytest.raises(HTTPError):
+    with pytest.raises(HTTPStatusError):
         bf.fork_snapshot(base_name="bogus", name=name)
 
 
@@ -202,7 +202,7 @@ def test_get_snapshot_input_object(bf: Session, network: str, example_snapshot: 
     bf.set_network(network)
     bf.set_snapshot(example_snapshot)
     # non-existent input object should yield 404
-    with pytest.raises(HTTPError, match="404"):
+    with pytest.raises(HTTPStatusError, match="404"):
         bf.get_snapshot_input_object_text("missing_object")
     # should be able to retrieve input object text
     assert bf.get_snapshot_input_object_text("other_dir/other_file") == "hello"
@@ -230,7 +230,7 @@ def test_delete_snapshot_object(bf: Session, network: str, example_snapshot: str
     assert bf.get_snapshot_object_text("new_object") == "goodbye"
     # object should no longer exist after being deleted
     bf.delete_snapshot_object("new_object")
-    with pytest.raises(HTTPError, match="404"):
+    with pytest.raises(HTTPStatusError, match="404"):
         bf.get_snapshot_object_text("new_object")
 
 
@@ -239,7 +239,7 @@ def test_get_snapshot_object(bf: Session, network: str, example_snapshot: str) -
     bf.set_network(network)
     bf.set_snapshot(example_snapshot)
     # non-existent object should yield 404
-    with pytest.raises(HTTPError, match="404"):
+    with pytest.raises(HTTPStatusError, match="404"):
         bf.get_snapshot_object_text("missing_object")
     # object should exist after being placed
     bf.put_snapshot_object("new_object", "goodbye")

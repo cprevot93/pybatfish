@@ -27,7 +27,7 @@ from typing import (
     Any,
 )
 
-from requests import HTTPError
+from httpx2 import HTTPStatusError
 
 from pybatfish.client import restv2helper, workhelper
 from pybatfish.client._facts import get_facts, load_facts, validate_facts, write_facts
@@ -319,8 +319,9 @@ class Session:
     :ivar port_v2: Legacy alias for port
     :ivar ssl: Whether to use SSL when connecting to Batfish (False by default)
     :ivar api_key: Your API key
-    :ivar proxies: A dictionary of proxies to use for the session. See `requests` documentation for details.
-    :ivar timeout: Timeout for requests in seconds (default is 30 seconds)
+    :ivar proxies: A dictionary of proxy URLs using the existing ``http`` and
+        ``https`` keys; these are translated into HTTPX2 mounts.
+    :ivar timeout: Timeout for HTTPX2 requests in seconds (default is 30 seconds)
     """
 
     def __init__(
@@ -366,10 +367,26 @@ class Session:
         self.stale_timeout: int = 5
         self.proxies = proxies
         self.timeout = timeout
+        # HTTPX2 clients are created lazily by restv2helper.  Keeping these
+        # attributes on the Session gives each Session its own connection pool
+        # while preserving the historical ability to construct a Session
+        # without immediately opening a socket.
+        self._httpx_client = None
+        self._httpx_client_config = None
 
         # Auto-load question templates
         if load_questions:
             self.q.load()
+
+    def close(self) -> None:
+        """Release HTTPX2 connection pools owned by this session."""
+        restv2helper.close_session(self)
+
+    def __enter__(self) -> Session:
+        return self
+
+    def __exit__(self, exc_type: Any, exc_value: Any, traceback: Any) -> None:
+        self.close()
 
     @classmethod
     def get_session_types(cls) -> dict[str, Callable]:
@@ -959,7 +976,7 @@ class Session:
             net = restv2helper.get_network(self, name)
             self.network = str(net["name"])
             return self.network
-        except HTTPError as e:
+        except HTTPStatusError as e:
             if e.response is None or e.response.status_code != 404:
                 raise BatfishException("Unknown error accessing network", e)
 

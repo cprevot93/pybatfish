@@ -46,11 +46,9 @@ dependencies = [
     "pandas",
     "python-dateutil",
     "PyYAML",
-    "requests[socks]>=2.32.5",
-    "requests-toolbelt",
+    "httpx2[socks]>=2.12.0",
     "setuptools",
     "simplejson",
-    "urllib3>=1.26.0",
 ]
 
 [project.urls]
@@ -78,8 +76,6 @@ dev = [
     "pytest-cov",
     "pytz",
     "recommonmark",
-    "requests_mock",
-    "responses",
     "sphinx>=1.8.0",
     "sphinx-notfound-page",
     "sphinx_rtd_theme",
@@ -87,7 +83,6 @@ dev = [
     "types-python-dateutil",
     "types-pytz",
     "types-PyYAML",
-    "types-requests",
     "types-setuptools",
     "types-simplejson",
     "capirca",

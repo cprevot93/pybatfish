@@ -30,7 +30,7 @@ class Options:
     default_question_prefix = "q"  # type: str
     default_snapshot_prefix = "ss_"  # type: str
 
-    # Parameters for urllib3.Retry, see docs there for more info
+    # Parameters for the HTTPX2 retry policy.
     #
     # Read as "try" "time to sleep if this fails" "total sleep so far"
     #

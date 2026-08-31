@@ -14,8 +14,8 @@
 import json
 import os
 
+import httpx2
 import pytest
-import responses
 
 from pybatfish.client.session import Session
 from pybatfish.question.question import QuestionBase, QuestionMeta, _install_questions
@@ -122,7 +122,6 @@ def test_load_questions_local(session, tmpdir, questions):
         assert q in listed_questions
 
 
-@responses.activate
 def test_load_questions_remote(session, questions):
     """Test that questions are successfully loaded from a mock Batfish service."""
     # Should have no questions to start with
@@ -142,14 +141,15 @@ def test_load_questions_remote(session, questions):
             }
         )
 
-    # Intercept the GET request destined for the Batfish service, and just return json response
-    # (Success + question templates)
-    responses.add(
-        responses.GET,
-        "http://localhost:9996/v2/question_templates?verbose=False",
-        json=qs,
-        status=200,
-    )
+    def handler(request):
+        assert request.url.path == "/v2/question_templates"
+        assert request.url.params.get("verbose") == "false"
+        return httpx2.Response(200, json=qs, request=request)
+
+    # Install a transport on this Session's reusable HTTPX2 client.  This is
+    # the HTTPX2 equivalent of the old requests ``responses`` mock.
+    session._httpx_client = httpx2.Client(transport=httpx2.MockTransport(handler))
+    session._httpx_client_config = (True, tuple())
 
     session.q.load()
     listed_questions = session.q.list()

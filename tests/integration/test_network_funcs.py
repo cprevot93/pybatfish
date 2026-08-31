@@ -15,8 +15,8 @@ import typing
 from collections.abc import Sequence
 from os.path import abspath, dirname, join, realpath
 
+from httpx2 import HTTPStatusError
 from pytest import fixture, raises
-from requests.exceptions import HTTPError
 
 from pybatfish.client.consts import CoordConsts
 from pybatfish.client.options import Options
@@ -65,7 +65,7 @@ def test_delete_network_object(bf: Session, network: str) -> None:
     bf.put_network_object("new_object", "goodbye")
     bf.delete_network_object("new_object")
     # the object should be non-existent now
-    with raises(HTTPError, match="404"):
+    with raises(HTTPStatusError, match="404"):
         bf.get_network_object_text("new_object")
 
 
@@ -106,7 +106,7 @@ def test_add_node_roles_data(bf: Session) -> None:
 @requires_bf("2024.07.01")
 def test_get_network_object(bf: Session, network: str) -> None:
     # non-existent object should yield 404
-    with raises(HTTPError, match="404"):
+    with raises(HTTPStatusError, match="404"):
         bf.get_network_object_text("missing_object")
     # object should exist after being placed
     bf.put_network_object("new_object", "goodbye")
