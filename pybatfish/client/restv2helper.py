@@ -17,7 +17,7 @@ import email.utils
 import io
 import sys
 import time
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from typing import IO, TYPE_CHECKING, Any
 
 import httpx2
@@ -39,6 +39,7 @@ if TYPE_CHECKING:
 
 # List of HTTP statuses to retry
 _STATUS_FORCELIST = [429, 500, 502, 503, 504]
+_IDEMPOTENT_METHODS = frozenset({"DELETE", "GET", "HEAD", "OPTIONS", "PUT", "TRACE"})
 
 _encoder = BfJsonEncoder()
 
@@ -164,7 +165,16 @@ def init_network(session: Session, new_network_name: str) -> None:
 
 def upload_snapshot(session: Session, snapshot_name: str, fd: IO) -> None:
     url_tail = f"/{CoordConstsV2.RSC_NETWORKS}/{session.network}/{CoordConstsV2.RSC_SNAPSHOTS}/{snapshot_name}"
-    _post(session, url_tail, None, stream=fd)
+    # Sending a snapshot takes as long as it takes; a session that did not ask
+    # for a timeout gets none here, since timing out mid-upload only leads to
+    # uploading the snapshot again.
+    _post(
+        session,
+        url_tail,
+        None,
+        stream=fd,
+        request_kwargs=session._get_request_kwargs(default_timeout=None),
+    )
 
 
 def get_network_object(session, key):
@@ -599,8 +609,8 @@ def _retry_delay(response: httpx2.Response | None, retry_number: int) -> float:
                 try:
                     date = email.utils.parsedate_to_datetime(retry_after)
                     if date.tzinfo is None:
-                        date = date.replace(tzinfo=timezone.utc)
-                    return float(max(0.0, (date - datetime.now(timezone.utc)).total_seconds()))
+                        date = date.replace(tzinfo=UTC)
+                    return float(max(0.0, (date - datetime.now(UTC)).total_seconds()))
                 except (TypeError, ValueError, OverflowError):
                     pass
     return float(min(Options.request_backoff_factor * (2**retry_number), 120.0))
@@ -619,9 +629,10 @@ def _request_options(
     headers: dict[str, str],
     json: Any,
     content: Any,
+    request_kwargs: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Build HTTPX2 request options while protecting transport invariants."""
-    generic = _session_request_kwargs(session)
+    generic = _session_request_kwargs(session) if request_kwargs is None else request_kwargs
     options = {key: value for key, value in generic.items() if key in _REQUEST_OPTION_NAMES}
 
     # Preserve additional caller headers while ensuring Batfish's required
@@ -640,7 +651,9 @@ def _request_options(
     options["params"] = _clean_params(params)
     options["json"] = json
     options["content"] = content
-    options["timeout"] = session.timeout
+    # An absent timeout in the resolved options means no timeout. HTTPX2
+    # requires an explicit None to disable its own default.
+    options["timeout"] = generic.get("timeout")
     return options
 
 
@@ -654,8 +667,9 @@ def _request(
     json: Any = None,
     content: Any = None,
     fail_fast: bool = False,
+    request_kwargs: dict[str, Any] | None = None,
 ) -> httpx2.Response:
-    """Issue a request with Batfish's method-independent retry policy."""
+    """Retry connections for all methods, and other failures for idempotent methods."""
     client = _get_client(session, fail_fast)
     url = session.get_base_url2() + url_tail
     max_retries = (
@@ -673,14 +687,24 @@ def _request(
         if attempt and not _rewind_body(content, position):
             raise ValueError("Request body cannot be rewound for retry")
         try:
-            response = client.request(method, url, **_request_options(session, params, request_headers, json, content))
-        except httpx2.TransportError:
-            if attempt + 1 >= max_attempts or not replayable:
+            response = client.request(
+                method, url, **_request_options(session, params, request_headers, json, content, request_kwargs)
+            )
+        except httpx2.TransportError as exc:
+            safe_to_retry = method in _IDEMPOTENT_METHODS or isinstance(
+                exc, (httpx2.ConnectError, httpx2.ConnectTimeout)
+            )
+            if not safe_to_retry or attempt + 1 >= max_attempts or not replayable:
                 raise
             time.sleep(_retry_delay(None, attempt))
             continue
 
-        if response.status_code in _STATUS_FORCELIST and attempt + 1 < max_attempts and replayable:
+        if (
+            method in _IDEMPOTENT_METHODS
+            and response.status_code in _STATUS_FORCELIST
+            and attempt + 1 < max_attempts
+            and replayable
+        ):
             delay = _retry_delay(response, attempt)
             response.close()
             time.sleep(delay)
@@ -815,6 +839,7 @@ def _post(
     obj: Any,
     params: dict[str, Any] | None = None,
     stream: IO | None = None,
+    request_kwargs: dict[str, Any] | None = None,
 ) -> None:
     """Issue an HTTPX2 POST request, optionally with JSON or raw content."""
     headers = _get_headers(session)
@@ -828,6 +853,7 @@ def _post(
         headers=headers,
         json=_encoder.default(obj) if obj is not None else None,
         content=stream,
+        request_kwargs=request_kwargs,
     ).close()
 
 

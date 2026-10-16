@@ -41,6 +41,7 @@ from pathlib import Path
 
 from pybatfish.client.session import Session
 from pybatfish.datamodel import HeaderConstraints, Interface
+from pybatfish.datamodel.answer import TableAnswer
 
 # Legacy next-hop column names that Batfish is deprecating.  The structured
 # ``Next_Hop`` column contains the same information in a richer format and
@@ -54,6 +55,22 @@ _LEGACY_NEXTHOP_COLUMNS: frozenset[str] = frozenset(
         "NextHopInterface",
     ]
 )
+
+# Maps get_edges edge types to Batfish question names.
+_EDGE_QUESTIONS: dict[str, str] = {
+    "layer1": "layer1Edges",
+    "layer3": "layer3Edges",
+    "user_provided_layer1": "userProvidedLayer1Edges",
+    "bgp": "bgpEdges",
+    "eigrp": "eigrpEdges",
+    "ipsec": "ipsecEdges",
+    "isis": "isisEdges",
+    "ospf": "ospfEdges",
+    "vxlan": "vxlanEdges",
+}
+
+# Supported values of the traceroute tools' trace_format parameter.
+_TRACE_FORMATS: frozenset[str] = frozenset(["text", "structured", "summary"])
 
 # Default path for the sessions configuration file.
 _SESSIONS_CONFIG_PATH = Path.home() / ".batfish" / "sessions.json"
@@ -161,6 +178,94 @@ def _drop_legacy_nexthop_columns(df: Any) -> Any:
     return df
 
 
+def _parse_json_object(value: str, param_name: str) -> dict[str, Any]:
+    """Parse a tool parameter that must be a JSON object; empty means ``{}``."""
+    if not value:
+        return {}
+    parsed = json.loads(value) if isinstance(value, str) else value
+    if not isinstance(parsed, dict):
+        raise ValueError(f"{param_name} must be a JSON object, got {value!r}")
+    return parsed
+
+
+def _json_default(value: Any) -> Any:
+    """JSON-encode sets as sorted lists and anything else as its string form."""
+    if isinstance(value, (set, frozenset)):
+        return sorted(value)
+    return str(value)
+
+
+def _rows_to_json(df: Any, max_rows: int = 0) -> str:
+    """Convert a DataFrame to JSON, optionally keeping only the first *max_rows* rows.
+
+    With ``max_rows <= 0`` this is :func:`_df_to_json`. Otherwise the result is
+    a JSON object ``{"rows": [...], "total_rows": N, "truncated": bool}``.
+    """
+    if max_rows <= 0:
+        return _df_to_json(df)
+    total_rows = len(df)
+    rows = json.loads(_df_to_json(df.head(max_rows)))
+    return json.dumps({"rows": rows, "total_rows": total_rows, "truncated": total_rows > max_rows})
+
+
+def _structured_trace(trace: Any) -> dict[str, Any]:
+    """Convert a :class:`~pybatfish.datamodel.flow.Trace` to a JSON-friendly dict."""
+    return {
+        "disposition": trace.disposition,
+        "hops": [
+            {
+                "node": hop.node,
+                "steps": [
+                    {"action": step.action, "detail": str(step.detail) if step.detail else None}
+                    for step in hop.steps
+                    if step is not None
+                ],
+            }
+            for hop in trace.hops
+        ],
+    }
+
+
+def _summarize_traces(traces: list[Any]) -> list[dict[str, Any]]:
+    """Collapse traces into distinct (disposition, node path) entries with counts.
+
+    Entries are ordered by first appearance in *traces*.
+    """
+    counts: dict[tuple[str, tuple[str, ...]], int] = {}
+    for trace in traces:
+        key = (trace.disposition, tuple(hop.node for hop in trace.hops))
+        counts[key] = counts.get(key, 0) + 1
+    return [
+        {"disposition": disposition, "nodes": list(nodes), "count": count}
+        for (disposition, nodes), count in counts.items()
+    ]
+
+
+def _traces_df_to_json(df: Any, trace_columns: list[str], trace_format: str) -> str:
+    """Convert a traceroute answer DataFrame to JSON, rendering traces per *trace_format*.
+
+    ``"text"`` renders each trace as its string form (the default
+    :func:`_df_to_json` behavior). ``"structured"`` renders each trace with
+    :func:`_structured_trace`. ``"summary"`` replaces each trace list with
+    :func:`_summarize_traces`.
+    """
+    if trace_format not in _TRACE_FORMATS:
+        raise ValueError(
+            f"Unknown trace_format {trace_format!r}. Expected one of: {', '.join(sorted(_TRACE_FORMATS))}."
+        )
+    if trace_format == "text" or not hasattr(df, "columns"):
+        return _df_to_json(df)
+    df = df.copy()
+    for col in trace_columns:
+        if col not in df.columns:
+            continue
+        if trace_format == "structured":
+            df[col] = df[col].map(lambda traces: [_structured_trace(t) for t in traces])
+        else:
+            df[col] = df[col].map(_summarize_traces)
+    return _df_to_json(df)
+
+
 def create_server(
     name: str = "Batfish",
     default_session: Session | None = None,
@@ -235,6 +340,34 @@ def create_server(
         """
         return json.dumps({name: cfg.get("type", "unknown") for name, cfg in _session_configs.items()})
 
+    @mcp.tool()
+    def get_server_info(session: str = "default") -> str:
+        """Report which Batfish service a session is connected to.
+
+        Use this to distinguish between different Batfish builds or versions
+        that listen on the same host and port. Builds from the same source
+        version report the same component versions; num_questions (the number
+        of question templates the service provides) can still differ.
+
+        :param session: Named session to use (default: 'default').
+        :return: JSON object with the session name and type, the pybatfish
+            Session class, host, the component versions reported by the
+            service (e.g. {"Batfish": "...", "Z3": "..."}), and num_questions.
+        """
+        bf = _get_session(session)
+        cfg = _session_configs.get(session, {})
+        return json.dumps(
+            {
+                "session": session,
+                "session_type": cfg.get("type", "unknown"),
+                "session_class": f"{type(bf).__module__}.{type(bf).__qualname__}",
+                "host": getattr(bf, "host", None),
+                "component_versions": bf.get_component_versions(),
+                "num_questions": len(bf.q.list()),
+            },
+            default=str,
+        )
+
     # -------------------------------------------------------------------------
     # Network management tools
     # -------------------------------------------------------------------------
@@ -294,6 +427,7 @@ def create_server(
         snapshot_path: str,
         snapshot_name: str = "",
         overwrite: bool = False,
+        extra_args: str = "{}",
         session: str = "default",
     ) -> str:
         """Initialize a new snapshot from a local directory or zip file.
@@ -305,14 +439,21 @@ def create_server(
         :param snapshot_path: Local path to a snapshot directory or zip file.
         :param snapshot_name: Optional name for the snapshot. Auto-generated if empty.
         :param overwrite: Whether to overwrite an existing snapshot with the same name.
+        :param extra_args: JSON object of extra arguments passed to Batfish with
+            the snapshot processing work item (optional), e.g. '{"debugflags": "..."}'.
         :param session: Named session to use (default: 'default').
         :return: JSON object with the initialized snapshot name.
         """
         bf = _mgmt_session(session, network)
+        kwargs: dict[str, Any] = {}
+        parsed_extra_args = _parse_json_object(extra_args, "extra_args")
+        if parsed_extra_args:
+            kwargs["extra_args"] = parsed_extra_args
         name = bf.init_snapshot(
             snapshot_path,
             name=snapshot_name or None,
             overwrite=overwrite,
+            **kwargs,
         )
         return json.dumps({"snapshot": name})
 
@@ -324,6 +465,7 @@ def create_server(
         snapshot_name: str = "",
         platform: str = "",
         overwrite: bool = False,
+        extra_args: str = "{}",
         session: str = "default",
     ) -> str:
         """Initialize a single-device snapshot from configuration text.
@@ -338,16 +480,23 @@ def create_server(
         :param platform: RANCID platform string (e.g. 'cisco-nx', 'arista', 'juniper').
             If empty, the platform is inferred from the configuration header.
         :param overwrite: Whether to overwrite an existing snapshot with the same name.
+        :param extra_args: JSON object of extra arguments passed to Batfish with
+            the snapshot processing work item (optional), e.g. '{"debugflags": "..."}'.
         :param session: Named session to use (default: 'default').
         :return: JSON object with the initialized snapshot name.
         """
         bf = _mgmt_session(session, network)
+        kwargs: dict[str, Any] = {}
+        parsed_extra_args = _parse_json_object(extra_args, "extra_args")
+        if parsed_extra_args:
+            kwargs["extra_args"] = parsed_extra_args
         name = bf.init_snapshot_from_text(
             config_text,
             filename=filename,
             snapshot_name=snapshot_name or None,
             platform=platform or None,
             overwrite=overwrite,
+            **kwargs,
         )
         return json.dumps({"snapshot": name})
 
@@ -374,6 +523,7 @@ def create_server(
         restore_nodes: str = "",
         restore_interfaces: str = "",
         overwrite: bool = False,
+        extra_args: str = "{}",
         session: str = "default",
     ) -> str:
         """Fork an existing snapshot, optionally deactivating or restoring nodes/interfaces.
@@ -389,10 +539,16 @@ def create_server(
         :param restore_nodes: Comma-separated list of node names to restore.
         :param restore_interfaces: Comma-separated list of 'node[interface]' pairs to restore.
         :param overwrite: Whether to overwrite an existing snapshot with the same name.
+        :param extra_args: JSON object of extra arguments passed to Batfish with
+            the snapshot processing work item (optional), e.g. '{"debugflags": "..."}'.
         :param session: Named session to use (default: 'default').
         :return: JSON object with the forked snapshot name.
         """
         bf = _mgmt_session(session, network)
+        kwargs: dict[str, Any] = {}
+        parsed_extra_args = _parse_json_object(extra_args, "extra_args")
+        if parsed_extra_args:
+            kwargs["extra_args"] = parsed_extra_args
 
         deactivate_nodes_list = [n.strip() for n in deactivate_nodes.split(",") if n.strip()] or None
         restore_nodes_list = [n.strip() for n in restore_nodes.split(",") if n.strip()] or None
@@ -408,8 +564,36 @@ def create_server(
             deactivate_interfaces=deactivate_ifaces or None,
             restore_nodes=restore_nodes_list,
             restore_interfaces=restore_ifaces or None,
+            **kwargs,
         )
         return json.dumps({"snapshot": name})
+
+    @mcp.tool()
+    def generate_dataplane(
+        network: str,
+        snapshot: str,
+        extra_args: str = "{}",
+        session: str = "default",
+    ) -> str:
+        """Generate (or regenerate) the data plane for a snapshot.
+
+        Batfish otherwise computes the data plane with default settings the
+        first time a question needs it. Call this tool before other queries to
+        control how it is computed, e.g. to pass debug flags. Batfish stores
+        the result with the snapshot and later questions on that snapshot reuse
+        it. Calling this again recomputes and replaces the stored data plane.
+
+        :param network: Name of the network.
+        :param snapshot: Name of the snapshot.
+        :param extra_args: JSON object of extra arguments passed to Batfish with
+            the work item, e.g. '{"debugflags": "traceroute"}'.
+        :param session: Named session to use (default: 'default').
+        :return: JSON object with the snapshot name and the work status.
+        """
+        bf = _mgmt_session(session, network)
+        parsed_extra_args = _parse_json_object(extra_args, "extra_args")
+        status = bf.generate_dataplane(snapshot=snapshot, extra_args=parsed_extra_args or None)
+        return json.dumps({"snapshot": snapshot, "status": status})
 
     # -------------------------------------------------------------------------
     # Initialization diagnostics tools
@@ -542,6 +726,8 @@ def create_server(
         ip_protocols: str = "",
         src_ports: str = "",
         dst_ports: str = "",
+        trace_format: str = "text",
+        max_traces: int = 0,
         session: str = "default",
     ) -> str:
         """Simulate a traceroute from a location to a destination IP address.
@@ -558,8 +744,17 @@ def create_server(
         :param ip_protocols: IP protocol(s) e.g. 'TCP' (optional).
         :param src_ports: Source port(s) e.g. '1024-65535' (optional).
         :param dst_ports: Destination port(s) e.g. '22' (optional).
+        :param trace_format: How to render each trace (default: 'text').
+            'text': preformatted string per trace ("ACCEPTED\\n1. node: ...").
+            'structured': {"disposition", "hops": [{"node", "steps": [{"action", "detail"}]}]}.
+            'summary': {"disposition", "nodes": [...], "count"} per distinct path,
+            counting identical disposition + node sequences among the returned traces.
+        :param max_traces: Maximum number of traces Batfish returns per flow (optional).
+            Batfish's own default is 32. Batfish prunes to keep a diverse set of
+            dispositions and paths.
         :param session: Named session to use (default: 'default').
-        :return: JSON array of traceroute result rows.
+        :return: JSON array of traceroute result rows. TraceCount is the total
+            number of traces for the flow before max_traces pruning.
         """
         bf = _analysis_session(session, network, snapshot)
 
@@ -571,8 +766,12 @@ def create_server(
             src_ports=src_ports,
             dst_ports=dst_ports,
         )
-        result = bf.q.traceroute(startLocation=start_location, headers=headers).answer().frame()  # type: ignore[attr-defined]
-        return _df_to_json(result)
+        kwargs: dict[str, Any] = {"startLocation": start_location, "headers": headers}
+        if max_traces > 0:
+            kwargs["maxTraces"] = max_traces
+
+        result = bf.q.traceroute(**kwargs).answer().frame()  # type: ignore[attr-defined]
+        return _traces_df_to_json(result, ["Traces"], trace_format)
 
     @mcp.tool()
     def run_bidirectional_traceroute(
@@ -585,6 +784,8 @@ def create_server(
         ip_protocols: str = "",
         src_ports: str = "",
         dst_ports: str = "",
+        trace_format: str = "text",
+        max_traces: int = 0,
         session: str = "default",
     ) -> str:
         """Simulate a bidirectional traceroute (forward + reverse paths).
@@ -601,6 +802,15 @@ def create_server(
         :param ip_protocols: IP protocol(s) (optional).
         :param src_ports: Source port(s) (optional).
         :param dst_ports: Destination port(s) (optional).
+        :param trace_format: How to render each trace (default: 'text').
+            'text': preformatted string per trace ("ACCEPTED\\n1. node: ...").
+            'structured': {"disposition", "hops": [{"node", "steps": [{"action", "detail"}]}]}.
+            'summary': {"disposition", "nodes": [...], "count"} per distinct path,
+            counting identical disposition + node sequences among the returned traces.
+        :param max_traces: Maximum number of traces Batfish returns per flow (optional).
+            Batfish's own default is 32. Batfish prunes to keep a diverse set of
+            dispositions and paths. For this tool, the limit applies to
+            forward/reverse trace pairs.
         :param session: Named session to use (default: 'default').
         :return: JSON array of bidirectional traceroute result rows.
         """
@@ -614,8 +824,12 @@ def create_server(
             src_ports=src_ports,
             dst_ports=dst_ports,
         )
-        result = bf.q.bidirectionalTraceroute(startLocation=start_location, headers=headers).answer().frame()  # type: ignore[attr-defined]
-        return _df_to_json(result)
+        kwargs: dict[str, Any] = {"startLocation": start_location, "headers": headers}
+        if max_traces > 0:
+            kwargs["maxTraces"] = max_traces
+
+        result = bf.q.bidirectionalTraceroute(**kwargs).answer().frame()  # type: ignore[attr-defined]
+        return _traces_df_to_json(result, ["Forward_Traces", "Reverse_Traces"], trace_format)
 
     @mcp.tool()
     def check_reachability(
@@ -770,6 +984,8 @@ def create_server(
         vrfs: str = "",
         network_prefix: str = "",
         protocols: str = "",
+        prefix_match_type: str = "",
+        max_rows: int = 0,
         session: str = "default",
     ) -> str:
         """Retrieve the routing table (RIB) from one or more devices.
@@ -783,6 +999,13 @@ def create_server(
         :param vrfs: VRF specifier to restrict results (optional).
         :param network_prefix: Prefix to filter routes by (optional).
         :param protocols: Routing protocol(s) to filter by, e.g. 'bgp,ospf' (optional).
+        :param prefix_match_type: Prefix matching criterion for network_prefix: EXACT
+            (Batfish default), LONGEST_PREFIX_MATCH, LONGER_PREFIXES, or SHORTER_PREFIXES
+            (optional). Use LONGEST_PREFIX_MATCH with a /32 prefix to find the route an
+            IP address uses.
+        :param max_rows: Maximum number of rows to return (optional). When set, the
+            result is a JSON object {"rows": [...], "total_rows": N, "truncated": bool}
+            instead of a bare array.
         :param session: Named session to use (default: 'default').
         :return: JSON array of routing table rows.
         """
@@ -797,9 +1020,11 @@ def create_server(
             kwargs["network"] = network_prefix
         if protocols:
             kwargs["protocols"] = protocols
+        if prefix_match_type:
+            kwargs["prefixMatchType"] = prefix_match_type
 
         result = _drop_legacy_nexthop_columns(bf.q.routes(**kwargs).answer().frame())  # type: ignore[attr-defined]
-        return _df_to_json(result)
+        return _rows_to_json(result, max_rows)
 
     @mcp.tool()
     def compare_routes(
@@ -810,6 +1035,8 @@ def create_server(
         vrfs: str = "",
         network_prefix: str = "",
         protocols: str = "",
+        prefix_match_type: str = "",
+        max_rows: int = 0,
         session: str = "default",
     ) -> str:
         """Compare routing tables between two snapshots to identify route changes.
@@ -827,6 +1054,13 @@ def create_server(
         :param vrfs: VRF specifier to restrict results (optional).
         :param network_prefix: Prefix to filter routes by (optional).
         :param protocols: Routing protocol(s) to filter by (optional).
+        :param prefix_match_type: Prefix matching criterion for network_prefix: EXACT
+            (Batfish default), LONGEST_PREFIX_MATCH, LONGER_PREFIXES, or SHORTER_PREFIXES
+            (optional). Use LONGEST_PREFIX_MATCH with a /32 prefix to find the route an
+            IP address uses.
+        :param max_rows: Maximum number of rows to return (optional). When set, the
+            result is a JSON object {"rows": [...], "total_rows": N, "truncated": bool}
+            instead of a bare array.
         :param session: Named session to use (default: 'default').
         :return: JSON array showing route differences (added/removed routes).
         """
@@ -841,11 +1075,13 @@ def create_server(
             kwargs["network"] = network_prefix
         if protocols:
             kwargs["protocols"] = protocols
+        if prefix_match_type:
+            kwargs["prefixMatchType"] = prefix_match_type
 
         result = _drop_legacy_nexthop_columns(
             bf.q.routes(**kwargs).answer(snapshot=snapshot, reference_snapshot=reference_snapshot).frame()  # type: ignore[attr-defined]
         )
-        return _df_to_json(result)
+        return _rows_to_json(result, max_rows)
 
     @mcp.tool()
     def get_bgp_rib(
@@ -856,6 +1092,7 @@ def create_server(
         network_prefix: str = "",
         prefix_match_type: str = "",
         status: str = "",
+        max_rows: int = 0,
         session: str = "default",
     ) -> str:
         """Retrieve the BGP RIB (Routing Information Base) from devices.
@@ -872,6 +1109,9 @@ def create_server(
         :param prefix_match_type: Prefix matching criterion: EXACT,
             LONGEST_PREFIX_MATCH, LONGER_PREFIXES, or SHORTER_PREFIXES (optional).
         :param status: BGP route status specifier to filter by (optional).
+        :param max_rows: Maximum number of rows to return (optional). When set, the
+            result is a JSON object {"rows": [...], "total_rows": N, "truncated": bool}
+            instead of a bare array.
         :param session: Named session to use (default: 'default').
         :return: JSON array of BGP RIB rows.
         """
@@ -890,7 +1130,7 @@ def create_server(
             kwargs["status"] = status
 
         result = _drop_legacy_nexthop_columns(bf.q.bgpRib(**kwargs).answer().frame())  # type: ignore[attr-defined]
-        return _df_to_json(result)
+        return _rows_to_json(result, max_rows)
 
     @mcp.tool()
     def get_evpn_rib(
@@ -900,6 +1140,7 @@ def create_server(
         vrfs: str = "",
         network_prefix: str = "",
         prefix_match_type: str = "",
+        max_rows: int = 0,
         session: str = "default",
     ) -> str:
         """Retrieve the EVPN RIB (Routing Information Base) from devices.
@@ -915,6 +1156,9 @@ def create_server(
         :param network_prefix: Prefix to filter routes by (optional).
         :param prefix_match_type: Prefix matching criterion: EXACT,
             LONGEST_PREFIX_MATCH, LONGER_PREFIXES, or SHORTER_PREFIXES (optional).
+        :param max_rows: Maximum number of rows to return (optional). When set, the
+            result is a JSON object {"rows": [...], "total_rows": N, "truncated": bool}
+            instead of a bare array.
         :param session: Named session to use (default: 'default').
         :return: JSON array of EVPN RIB rows.
         """
@@ -931,7 +1175,44 @@ def create_server(
             kwargs["prefixMatchType"] = prefix_match_type
 
         result = _drop_legacy_nexthop_columns(bf.q.evpnRib(**kwargs).answer().frame())  # type: ignore[attr-defined]
-        return _df_to_json(result)
+        return _rows_to_json(result, max_rows)
+
+    @mcp.tool()
+    def get_lpm_routes(
+        network: str,
+        snapshot: str,
+        ip: str,
+        nodes: str = "",
+        vrfs: str = "",
+        max_rows: int = 0,
+        session: str = "default",
+    ) -> str:
+        """Find the longest-prefix-match routes for an IP address in the main RIB.
+
+        Returns, per node and VRF, the routes that a packet to the given IP
+        would match.
+
+        :param network: Name of the network.
+        :param snapshot: Name of the snapshot.
+        :param ip: IP address to look up, e.g. '10.0.0.1'.
+        :param nodes: Node specifier to restrict results (optional).
+        :param vrfs: VRF specifier to restrict results (optional).
+        :param max_rows: Maximum number of rows to return (optional). When set, the
+            result is a JSON object {"rows": [...], "total_rows": N, "truncated": bool}
+            instead of a bare array.
+        :param session: Named session to use (default: 'default').
+        :return: JSON array of LPM route rows.
+        """
+        bf = _analysis_session(session, network, snapshot)
+
+        kwargs: dict[str, Any] = {"ip": ip}
+        if nodes:
+            kwargs["nodes"] = nodes
+        if vrfs:
+            kwargs["vrfs"] = vrfs
+
+        result = bf.q.lpmRoutes(**kwargs).answer().frame()  # type: ignore[attr-defined]
+        return _rows_to_json(result, max_rows)
 
     # -------------------------------------------------------------------------
     # BGP tools
@@ -1159,6 +1440,52 @@ def create_server(
         return _df_to_json(result)
 
     # -------------------------------------------------------------------------
+    # Topology tools
+    # -------------------------------------------------------------------------
+
+    @mcp.tool()
+    def get_edges(
+        network: str,
+        snapshot: str,
+        edge_type: str = "layer3",
+        nodes: str = "",
+        remote_nodes: str = "",
+        max_rows: int = 0,
+        session: str = "default",
+    ) -> str:
+        """List topology edges (adjacencies) of a given type.
+
+        :param network: Name of the network.
+        :param snapshot: Name of the snapshot.
+        :param edge_type: Edge type (default: 'layer3'). One of 'layer1', 'layer3',
+            'user_provided_layer1', 'bgp', 'eigrp', 'ipsec', 'isis', 'ospf', 'vxlan'.
+            'layer1' is the layer-1 topology Batfish uses after processing;
+            'user_provided_layer1' is the layer-1 topology as provided in the
+            snapshot (layer1_topology.json).
+        :param nodes: Node specifier for the first node of each edge, e.g. a name
+            or '/regex/' (optional).
+        :param remote_nodes: Node specifier for the second node of each edge (optional).
+        :param max_rows: Maximum number of rows to return (optional). When set, the
+            result is a JSON object {"rows": [...], "total_rows": N, "truncated": bool}
+            instead of a bare array.
+        :param session: Named session to use (default: 'default').
+        :return: JSON array of edge rows.
+        """
+        question_name = _EDGE_QUESTIONS.get(edge_type)
+        if question_name is None:
+            raise ValueError(f"Unknown edge_type {edge_type!r}. Expected one of: {', '.join(_EDGE_QUESTIONS)}.")
+        bf = _analysis_session(session, network, snapshot)
+
+        kwargs: dict[str, Any] = {}
+        if nodes:
+            kwargs["nodes"] = nodes
+        if remote_nodes:
+            kwargs["remoteNodes"] = remote_nodes
+
+        result = getattr(bf.q, question_name)(**kwargs).answer().frame()
+        return _rows_to_json(result, max_rows)
+
+    # -------------------------------------------------------------------------
     # Snapshot comparison tools
     # -------------------------------------------------------------------------
 
@@ -1309,6 +1636,76 @@ def create_server(
 
         result = bf.q.detectLoops().answer().frame()  # type: ignore[attr-defined]
         return _df_to_json(result)
+
+    # -------------------------------------------------------------------------
+    # Generic question tools
+    # -------------------------------------------------------------------------
+
+    @mcp.tool()
+    def list_questions(
+        tags: str = "",
+        session: str = "default",
+    ) -> str:
+        """List the questions the connected Batfish service supports.
+
+        Includes questions that have no dedicated tool on this server. Run
+        them with run_question.
+
+        :param tags: Comma-separated tags; only list questions with these tags (optional).
+        :param session: Named session to use (default: 'default').
+        :return: JSON array of {"name", "description", "tags"} objects.
+        """
+        bf = _get_session(session)
+        tag_list = [t.strip() for t in tags.split(",") if t.strip()] or None
+        return json.dumps(bf.q.list(tags=tag_list), default=_json_default)
+
+    @mcp.tool()
+    def run_question(
+        network: str,
+        snapshot: str,
+        question: str,
+        parameters: str = "{}",
+        reference_snapshot: str = "",
+        extra_args: str = "{}",
+        max_rows: int = 0,
+        session: str = "default",
+    ) -> str:
+        """Run any Batfish question by name.
+
+        Use this for questions without a dedicated tool. Use list_questions to
+        find question names.
+
+        :param network: Name of the network.
+        :param snapshot: Name of the snapshot.
+        :param question: Question name as listed by list_questions, e.g. 'nodeProperties'.
+        :param parameters: JSON object of question parameters, using Batfish's
+            parameter names, e.g. '{"nodes": "/leaf.*/"}' (optional).
+        :param reference_snapshot: Reference snapshot for differential questions (optional).
+        :param extra_args: JSON object of extra arguments passed to Batfish with the
+            question work item (optional).
+        :param max_rows: For table answers, maximum number of rows to return (optional).
+            When set, the result is a JSON object {"rows": [...], "total_rows": N,
+            "truncated": bool} instead of a bare array.
+        :param session: Named session to use (default: 'default').
+        :return: JSON array of answer rows for table answers; otherwise the
+            answer as a JSON object.
+        """
+        bf = _analysis_session(session, network, snapshot)
+        if question not in {q["name"] for q in bf.q.list()}:
+            raise ValueError(f"Unknown question {question!r}. Use list_questions to see available questions.")
+        question_class = getattr(bf.q, question)
+
+        answer_kwargs: dict[str, Any] = {"snapshot": snapshot}
+        if reference_snapshot:
+            answer_kwargs["reference_snapshot"] = reference_snapshot
+        parsed_extra_args = _parse_json_object(extra_args, "extra_args")
+        if parsed_extra_args:
+            answer_kwargs["extra_args"] = parsed_extra_args
+
+        answer = question_class(**_parse_json_object(parameters, "parameters")).answer(**answer_kwargs)
+        if isinstance(answer, TableAnswer):
+            return _rows_to_json(answer.frame(), max_rows)
+        return json.dumps(dict(answer), default=str)
 
     return mcp
 

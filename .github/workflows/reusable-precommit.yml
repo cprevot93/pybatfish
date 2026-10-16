@@ -23,7 +23,7 @@ jobs:
       - uses: actions/checkout@v7
       - uses: actions/setup-python@v7
         with:
-          python-version: "3.10"
+          python-version: "3.11"
       - name: Run checks
         run: |
           pip install pre-commit
@@ -34,7 +34,7 @@ jobs:
       - uses: actions/checkout@v7
       - uses: actions/setup-python@v7
         with:
-          python-version: "3.10"
+          python-version: "3.11"
       - name: Run checks
         run: |
           pip install --upgrade pip wheel 'setuptools>=77.0.1'
@@ -55,7 +55,7 @@ jobs:
           key: ${{runner.os}}-bazel-25-${{ hashFiles('.bazelversion', 'WORKSPACE', 'maven_install.json') }}-${{ needs.get_date.outputs.ymd }}
           restore-keys: |
             ${{runner.os}}-bazel-25-${{ hashFiles('.bazelversion', 'WORKSPACE', 'maven_install.json') }}-
-      - uses: actions/setup-java@v5
+      - uses: actions/setup-java@v6
         with:
           distribution: "temurin"
           java-version: "25"
@@ -101,7 +101,6 @@ jobs:
     strategy:
       matrix:
         python_version:
-          - "3.10"
           - "3.11"
           - "3.12"
           - "3.13"
@@ -112,7 +111,7 @@ jobs:
       - bf_build
     steps:
       - uses: actions/checkout@v7
-      - uses: actions/setup-java@v5
+      - uses: actions/setup-java@v6
         with:
           distribution: "temurin"
           java-version: "25"
@@ -150,7 +149,6 @@ jobs:
     strategy:
       matrix:
         python_version:
-          - "3.10"
           - "3.11"
           - "3.12"
           - "3.13"
@@ -161,7 +159,7 @@ jobs:
       - bf_build
     steps:
       - uses: actions/checkout@v7
-      - uses: actions/setup-java@v5
+      - uses: actions/setup-java@v6
         with:
           distribution: "temurin"
           java-version: "25"
@@ -188,13 +186,13 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
-      - uses: actions/setup-java@v5
+      - uses: actions/setup-java@v6
         with:
           distribution: "temurin"
           java-version: "25"
       - uses: actions/setup-python@v7
         with:
-          python-version: "3.10"
+          python-version: "3.11"
       - name: Build docs
         run: |
           sudo apt update -qq
@@ -210,12 +208,12 @@ jobs:
           name: docs
           path: docs/build/html
   readthedocs_build:
-    runs-on: ubuntu-22.04 # Match ReadTheDocs OS
+    runs-on: ubuntu-26.04 # Match ReadTheDocs OS
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-python@v7
         with:
-          python-version: "3.10" # Match ReadTheDocs Python version
+          python-version: "3.11" # Match ReadTheDocs Python version
       - name: Build docs in ReadTheDocs-like environment
         run: |
           sudo apt update -qq
